@@ -1,3 +1,5 @@
+import re
+
 from PySide6.QtGui import QIcon
 from PySide6.QtWidgets import (
     QButtonGroup,
@@ -18,8 +20,8 @@ from PySide6.QtWidgets import (
 
 from .. import config as cfg
 from .. import device_manager as dm
-from .pairing_wizard import PairingWizard
 from .settings_dialog import SettingsDialog
+from .wireless_pairing_dialog import UpdateAddressDialog, WirelessPairingDialog
 from .workers import Worker
 
 STATUS_UNKNOWN = "gray"
@@ -143,6 +145,17 @@ class MainWindow(QMainWindow):
         layout = QVBoxLayout(page)
         layout.setContentsMargins(0, 8, 0, 0)
 
+        hint = QLabel(
+            "Para conectar un celular por primera vez, en tu telefono ve a "
+            "Ajustes > Sistema > Opciones de desarrollador > Depuracion "
+            "inalambrica, y toca 'Emparejar dispositivo con codigo de "
+            "emparejamiento'. Luego pulsa 'Agregar celular nuevo' abajo y "
+            "copia ahi los datos que te muestre el telefono. No necesitas cable."
+        )
+        hint.setWordWrap(True)
+        hint.setStyleSheet("color: #888;")
+        layout.addWidget(hint)
+
         device_box = QGroupBox("Dispositivo emparejado")
         device_layout = QVBoxLayout(device_box)
 
@@ -170,14 +183,18 @@ class MainWindow(QMainWindow):
         self.wifi_start_btn.clicked.connect(self._on_wifi_start_clicked)
         actions_layout.addWidget(self.wifi_start_btn)
 
-        btn_row = QHBoxLayout()
         self.wifi_reconnect_btn = QPushButton("Reconectar por Wi-Fi")
         self.wifi_reconnect_btn.clicked.connect(self._on_reconnect_clicked)
-        self.wifi_add_device_btn = QPushButton("Conectar celular nuevo (USB)")
-        self.wifi_add_device_btn.clicked.connect(self._on_add_device_clicked)
-        btn_row.addWidget(self.wifi_reconnect_btn)
-        btn_row.addWidget(self.wifi_add_device_btn)
-        actions_layout.addLayout(btn_row)
+        actions_layout.addWidget(self.wifi_reconnect_btn)
+
+        self.wifi_update_addr_btn = QPushButton("Actualizar direccion de conexion")
+        self.wifi_update_addr_btn.clicked.connect(self._on_update_address_clicked)
+        actions_layout.addWidget(self.wifi_update_addr_btn)
+
+        self.wifi_add_wireless_btn = QPushButton("Agregar celular nuevo (Wi-Fi, sin cable)")
+        self.wifi_add_wireless_btn.setStyleSheet("font-weight: 600; padding: 8px;")
+        self.wifi_add_wireless_btn.clicked.connect(self._on_add_wireless_clicked)
+        actions_layout.addWidget(self.wifi_add_wireless_btn)
 
         self.wifi_forget_btn = QPushButton("Olvidar este dispositivo")
         self.wifi_forget_btn.clicked.connect(self._on_forget_clicked)
@@ -210,7 +227,8 @@ class MainWindow(QMainWindow):
             self.usb_start_btn,
             self.wifi_start_btn,
             self.wifi_reconnect_btn,
-            self.wifi_add_device_btn,
+            self.wifi_update_addr_btn,
+            self.wifi_add_wireless_btn,
             self.wifi_forget_btn,
             self.settings_btn,
         ):
@@ -311,51 +329,102 @@ class MainWindow(QMainWindow):
             return None
         return self.config.get("devices", {}).get(self.selected_serial)
 
+    @staticmethod
+    def _resolve_wifi_device(info: dict) -> dm.Device:
+        """Find the paired phone over the network. Tries adb's automatic
+        mDNS discovery first (no fixed ip:port needed, so it keeps working
+        even after Wireless debugging's address changes); only falls back to
+        the last-known saved address if nothing is auto-discovered."""
+        device = dm.find_wifi_device()
+        if device:
+            return device
+        dm.connect_tcpip(info["ip"], info["port"])
+        target = f"{info['ip']}:{info['port']}"
+        matches = [d for d in dm.list_devices() if d.serial == target]
+        return matches[0] if matches else dm.Device(serial=target, name=info.get("name", target), is_wifi=True)
+
+    def _sync_device_address(self, device: dm.Device):
+        """If the resolved device's address differs from what's saved (e.g.
+        Wireless debugging's port changed), update the saved entry so future
+        reconnects start from the right place even if auto-discovery fails."""
+        match = re.match(r"^(\d{1,3}(?:\.\d{1,3}){3}):(\d+)$", device.serial)
+        info = self._current_device_info()
+        if not match or not info or not self.selected_serial:
+            return
+        ip, port = match.group(1), int(match.group(2))
+        if (info["ip"], str(info["port"])) == (ip, str(port)):
+            return
+        name = info["name"]
+        cfg.forget_device(self.config, self.selected_serial)
+        new_serial = device.serial
+        cfg.remember_device(self.config, new_serial, name, ip, port)
+        self.selected_serial = new_serial
+        self._refresh_wifi_combo()
+
     def _try_auto_reconnect(self):
         info = self._current_device_info()
         if not info:
             return
         self._log(f"Reconectando con '{info['name']}' por Wi-Fi...")
         self._run_worker(
-            dm.connect_tcpip,
-            lambda _: self._set_status(True, f"Conectado ({info['ip']})"),
+            self._resolve_wifi_device,
+            self._on_reconnect_success,
             lambda err: self._set_status(False, "No disponible - usa 'Reconectar por Wi-Fi'"),
-            info["ip"],
-            info["port"],
+            info,
         )
 
     def _on_reconnect_clicked(self):
         info = self._current_device_info()
         if not info:
             return
-        self._log(f"Conectando con '{info['name']}' ({info['ip']}:{info['port']})...")
+        self._log(f"Conectando con '{info['name']}'...")
         self._run_worker(
-            dm.connect_tcpip,
+            self._resolve_wifi_device,
             self._on_reconnect_success,
             self._on_reconnect_failed,
-            info["ip"],
-            info["port"],
+            info,
         )
 
-    def _on_reconnect_success(self, _result):
+    def _on_reconnect_success(self, device: dm.Device):
+        self._sync_device_address(device)
         info = self._current_device_info()
-        self._set_status(True, f"Conectado ({info['ip']})")
+        self._set_status(True, f"Conectado ({info['ip']})" if info else "Conectado")
         self._log("Conexion establecida.")
 
     def _on_reconnect_failed(self, error: str):
         self._set_status(False, "Desconectado")
         self._log(f"No se pudo reconectar: {error}")
-        self._log("Sugerencia: si el celular cambio de red Wi-Fi, vuelve a emparejarlo por USB.")
+        self._log(
+            "Sugerencia: el puerto de Depuracion inalambrica puede haber "
+            "cambiado. Usa 'Actualizar direccion de conexion' con el dato "
+            "actual de tu celular."
+        )
 
-    def _on_add_device_clicked(self):
-        wizard = PairingWizard(self)
-        if wizard.exec() == PairingWizard.Accepted and wizard.result_device:
-            serial, name, ip, port = wizard.result_device
+    def _on_update_address_clicked(self):
+        info = self._current_device_info()
+        if not info:
+            return
+        old_serial = self.selected_serial
+        dialog = UpdateAddressDialog(info["ip"], info["port"], self)
+        if dialog.exec() == UpdateAddressDialog.Accepted and dialog.new_ip:
+            name = info["name"]
+            cfg.forget_device(self.config, old_serial)
+            new_serial = f"{dialog.new_ip}:{dialog.new_port}"
+            cfg.remember_device(self.config, new_serial, name, dialog.new_ip, dialog.new_port)
+            self.selected_serial = new_serial
+            self._refresh_wifi_combo()
+            self._set_status(True, f"Conectado ({dialog.new_ip})")
+            self._log(f"Direccion de conexion de '{name}' actualizada.")
+
+    def _on_add_wireless_clicked(self):
+        dialog = WirelessPairingDialog(self)
+        if dialog.exec() == WirelessPairingDialog.Accepted and dialog.result_device:
+            serial, name, ip, port = dialog.result_device
             cfg.remember_device(self.config, serial, name, ip, port)
             self.selected_serial = serial
             self._refresh_wifi_combo()
             self._set_status(True, f"Conectado ({ip})")
-            self._log(f"'{name}' agregado y conectado por Wi-Fi.")
+            self._log(f"'{name}' emparejado por Depuracion inalambrica (sin cable).")
 
     def _on_wifi_start_clicked(self):
         info = self._current_device_info()
@@ -363,27 +432,17 @@ class MainWindow(QMainWindow):
             return
         self._log("Iniciando control remoto...")
         self._run_worker(
-            self._ensure_connected_and_launch,
+            self._resolve_wifi_device,
             self._on_launch_success,
             self._on_launch_failed,
-            self.selected_serial,
             info,
         )
 
-    @staticmethod
-    def _ensure_connected_and_launch(serial: str, info: dict):
-        connected = any(d.serial in (serial, f"{info['ip']}:{info['port']}") for d in dm.list_devices())
-        if not connected:
-            dm.connect_tcpip(info["ip"], info["port"])
-        target = f"{info['ip']}:{info['port']}"
-        matches = [d for d in dm.list_devices() if d.serial == target]
-        real_serial = matches[0].serial if matches else target
-        return real_serial
-
-    def _on_launch_success(self, real_serial: str):
+    def _on_launch_success(self, device: dm.Device):
+        self._sync_device_address(device)
         self._set_status(True, "Conectado")
         try:
-            dm.launch_mirror(real_serial, self.config)
+            dm.launch_mirror(device.serial, self.config)
             self._log("Ventana de control remoto abierta.")
         except dm.DeviceError as exc:
             self._log(f"Error al iniciar scrcpy: {exc}")
@@ -396,8 +455,11 @@ class MainWindow(QMainWindow):
             self,
             "No se pudo conectar",
             "No se pudo conectar con el celular por Wi-Fi.\n\n"
-            "Verifica que este encendido y en la misma red Wi-Fi, o vuelve a "
-            "emparejarlo con 'Conectar celular nuevo (USB)'.",
+            "Verifica que este encendido y en la misma red Wi-Fi. Si ya "
+            "estaba emparejado antes, el puerto de Depuracion inalambrica "
+            "puede haber cambiado: usa 'Actualizar direccion de conexion' "
+            "con el dato actual de tu celular. Si nunca lo emparejaste, usa "
+            "'Agregar celular nuevo (Wi-Fi, sin cable)'.",
         )
 
     def _on_settings_clicked(self):

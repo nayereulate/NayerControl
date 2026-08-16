@@ -15,6 +15,11 @@ DEFAULTS = {
     "fullscreen": False,
     "turn_screen_off": False,
     "stay_awake": True,
+    "wifi_optimize": True,     # apply lighter video settings automatically over Wi-Fi
+    "wifi_bitrate_mbps": 6,
+    "wifi_max_size": 1280,     # 0 = original resolution
+    "wifi_max_fps": 30,        # 0 = uncapped
+    "wifi_no_audio": True,
 }
 
 

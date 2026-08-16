@@ -27,6 +27,14 @@ class DeviceError(RuntimeError):
     pass
 
 
+def is_wifi_serial(serial: str) -> bool:
+    if re.match(r"^\d{1,3}(\.\d{1,3}){3}:\d+$", serial):
+        return True
+    # Devices adb auto-discovers over the network via mDNS (no manual
+    # `adb connect` needed) get a serial like "adb-XXXX._adb-tls-connect._tcp".
+    return "_tcp" in serial
+
+
 @dataclass
 class Device:
     serial: str
@@ -68,8 +76,7 @@ def list_devices() -> list[Device]:
         if state != "device":
             continue
         name = get_device_name(serial) or serial
-        is_wifi = bool(re.match(r"^\d{1,3}(\.\d{1,3}){3}:\d+$", serial))
-        devices.append(Device(serial=serial, name=name, is_wifi=is_wifi))
+        devices.append(Device(serial=serial, name=name, is_wifi=is_wifi_serial(serial)))
     return devices
 
 
@@ -78,21 +85,16 @@ def list_usb_devices() -> list[Device]:
     return [d for d in list_devices() if not d.is_wifi]
 
 
-def find_authorized_usb_device() -> Device:
-    start_server()
-    devices = list_usb_devices()
-    if devices:
-        return devices[0]
-    pending = list_unauthorized()
-    if pending:
-        raise DeviceError(
-            "El celular pidio autorizacion. Acepta 'Permitir depuracion USB' "
-            "en la pantalla del telefono y vuelve a intentarlo."
-        )
-    raise DeviceError(
-        "No se detecto ningun celular por USB. Conecta el cable y activa "
-        "la Depuracion USB en Opciones de desarrollador."
-    )
+def find_wifi_device() -> Optional[Device]:
+    """Return a Wi-Fi device adb already knows about right now, including one
+    auto-discovered over the network via mDNS with no `adb connect` needed.
+    Once a phone has been paired at least once, this lets NayerControl find
+    it again on its own even after its Wireless debugging IP/port changes,
+    without the user having to copy anything from the phone's screen."""
+    for device in list_devices():
+        if device.is_wifi:
+            return device
+    return None
 
 
 def list_unauthorized() -> list[str]:
@@ -109,26 +111,6 @@ def get_device_name(serial: str) -> Optional[str]:
     result = _run(["-s", serial, "shell", "getprop", "ro.product.model"])
     name = result.stdout.strip()
     return name or None
-
-
-def get_device_ip(serial: str) -> Optional[str]:
-    """Best-effort detection of the phone's Wi-Fi IP address."""
-    result = _run(["-s", serial, "shell", "ip", "route"])
-    match = re.search(r"src\s+(\d{1,3}(?:\.\d{1,3}){3})", result.stdout)
-    if match:
-        return match.group(1)
-
-    result = _run(["-s", serial, "shell", "ip", "-f", "inet", "addr", "show", "wlan0"])
-    match = re.search(r"inet\s+(\d{1,3}(?:\.\d{1,3}){3})", result.stdout)
-    if match:
-        return match.group(1)
-    return None
-
-
-def enable_tcpip(serial: str, port: int = DEFAULT_TCPIP_PORT) -> None:
-    result = _run(["-s", serial, "tcpip", str(port)])
-    if result.returncode != 0:
-        raise DeviceError(f"No se pudo activar el modo TCP/IP: {result.stderr.strip()}")
 
 
 def connect_tcpip(ip: str, port: int = DEFAULT_TCPIP_PORT, timeout: int = 8) -> None:
@@ -156,12 +138,27 @@ def kill_server() -> None:
 
 def build_scrcpy_args(serial: str, options: dict) -> list[str]:
     args = ["-s", serial]
-    bitrate = options.get("bitrate_mbps")
+
+    over_wifi = is_wifi_serial(serial) and options.get("wifi_optimize", True)
+    if over_wifi:
+        # Wi-Fi has less bandwidth and more latency than USB: cap bitrate,
+        # resolution and frame rate, and skip audio, to keep the mirror smooth.
+        bitrate = options.get("wifi_bitrate_mbps")
+        max_size = options.get("wifi_max_size")
+        max_fps = options.get("wifi_max_fps")
+        if options.get("wifi_no_audio", True):
+            args.append("--no-audio")
+    else:
+        bitrate = options.get("bitrate_mbps")
+        max_size = options.get("max_size")
+        max_fps = None
+
     if bitrate:
         args += ["-b", f"{bitrate}M"]
-    max_size = options.get("max_size")
     if max_size:
         args += ["-m", str(max_size)]
+    if max_fps:
+        args += ["--max-fps", str(max_fps)]
     if options.get("fullscreen"):
         args.append("-f")
     if options.get("turn_screen_off"):
